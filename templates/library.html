@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}音频库{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>音频库</h1>
+    <div class="sub">上传、生成与管理音频文件 — 音频单独存储，元数据保存在 library.json（文件锁保护）</div>
+  </div>
+  <div id="stats" class="muted small"></div>
+</div>
+
+<div class="card">
+  <h2>上传音频</h2>
+  <div class="dropzone" id="drop">
+    <div>拖拽音频文件到此处，或点击选择</div>
+    <div class="faint small">支持 WAV / MP3 / OGG / FLAC / M4A（压缩格式经 ffmpeg 解码为 PCM WAV）</div>
+  </div>
+  <input type="file" id="fileInput" accept="audio/*,.wav,.mp3,.ogg,.flac,.m4a" class="hidden" />
+  <div class="progress hidden mt" id="uploadProgress"><span style="width:0"></span></div>
+</div>
+
+<div class="card">
+  <h2>生成测试信号</h2>
+  <div class="row">
+    <button data-kind="sine">正弦波</button>
+    <button data-kind="chord">大三和弦</button>
+    <button data-kind="pluck">拨弦</button>
+    <button data-kind="sweep">扫频</button>
+    <button data-kind="noise">白噪声</button>
+    <label class="field inline">频率 <input type="number" id="genFreq" value="220" min="20" max="4000" style="width:80px"/></label>
+    <label class="field inline">时长(s) <input type="number" id="genDur" value="4" min="0.5" max="60" style="width:80px"/></label>
+    <label class="field inline">采样率
+      <select id="genSr"><option value="22050">22050</option><option value="44100" selected>44100</option><option value="48000">48000</option></select>
+    </label>
+  </div>
+</div>
+
+<div class="card">
+  <h2>文件列表 <span id="countBadge" class="badge neutral"></span></h2>
+  <table>
+    <thead>
+      <tr><th>名称</th><th>时长</th><th>采样率</th><th>声道</th><th>大小</th><th>来源</th><th style="width:230px">操作</th></tr>
+    </thead>
+    <tbody id="fileList"></tbody>
+  </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const drop = $("#drop"), input = $("#fileInput"), list = $("#fileList");
+
+drop.addEventListener("click", () => input.click());
+input.addEventListener("change", () => { if (input.files[0]) upload(input.files[0]); });
+["dragover", "dragenter"].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.add("drag");
+}));
+["dragleave", "drop"].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.remove("drag");
+}));
+drop.addEventListener("drop", e => { if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]); });
+
+async function upload(file) {
+  const bar = $("#uploadProgress");
+  bar.classList.remove("hidden");
+  const span = bar.querySelector("span");
+  try {
+    await API.upload(file, p => span.style.width = (p * 100).toFixed(0) + "%");
+    toast("上传成功: " + file.name, "success");
+    span.style.width = "0"; bar.classList.add("hidden");
+    load();
+  } catch (err) {
+    toast("上传失败: " + err.message, "error");
+    bar.classList.add("hidden");
+  }
+}
+
+$$("[data-kind]").forEach(btn => btn.addEventListener("click", async () => {
+  btn.disabled = true;
+  try {
+    const body = {
+      kind: btn.dataset.kind,
+      freq: +$("#genFreq").value,
+      duration: +$("#genDur").value,
+      sr: +$("#genSr").value,
+    };
+    await API.post("/api/library/generate", body);
+    toast("已生成 " + body.kind + " 信号", "success");
+    load();
+  } catch (err) { toast(err.message, "error"); }
+  finally { btn.disabled = false; }
+}));
+
+const SRC_LABEL = {
+  generated: { text: "生成", cls: "purple" },
+  upload: { text: "上传", cls: "" },
+};
+function srcBadge(f) {
+  if (f.exported) return `<span class="badge amber">导出</span>`;
+  if (f.separation) return `<span class="badge purple">分离</span>`;
+  if (f.project_id) return `<span class="badge green">混音</span>`;
+  if (f.effects) return `<span class="badge purple">效果</span>`;
+  if (f.derived_from) return `<span class="badge">编辑</span>`;
+  if (f.original_format === "generated") return `<span class="badge neutral">生成</span>`;
+  return `<span class="badge neutral">${esc((f.original_format || "wav").toUpperCase())}</span>`;
+}
+
+async function load() {
+  const files = await API.get("/api/library");
+  const stats = await API.get("/api/stats");
+  $("#countBadge").textContent = files.length + " 个文件";
+  $("#stats").innerHTML =
+    `${stats.files} 文件 · ${fmtBytes(stats.total_bytes)} · ${stats.analyses} 分析 · ${stats.projects} 项目`;
+  list.innerHTML = files.map(f => `
+    <tr>
+      <td class="name">${esc(f.name)}</td>
+      <td class="mono">${fmtTime(f.duration)}</td>
+      <td class="mono">${f.sr} Hz</td>
+      <td>${f.channels === 2 ? "立体声" : f.channels === 1 ? "单声道" : f.channels}</td>
+      <td>${fmtBytes(f.size_bytes)}</td>
+      <td>${srcBadge(f)}</td>
+      <td class="row">
+        <button class="btn-sm" onclick="playFile('${f.id}','${esc(f.name)}')">▶ 播放</button>
+        <button class="btn-sm" onclick="location.href='/waveform?file=${f.id}'">编辑</button>
+        <button class="btn-sm" onclick="location.href='/spectrogram?file=${f.id}'">频谱</button>
+        <a class="btn btn-sm" href="${API.downloadUrl(f.id)}">下载</a>
+        <button class="btn-sm btn-danger" onclick="del('${f.id}')">删除</button>
+      </td>
+    </tr>`).join("");
+}
+
+async function del(id) {
+  if (!confirm("确定删除该文件及其分析结果？")) return;
+  await API.del("/api/library/" + id);
+  toast("已删除", "success");
+  load();
+}
+
+load();
+</script>
+{% endblock %}

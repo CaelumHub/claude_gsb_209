@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block title %}和弦识别{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>和弦识别与标注</h1>
+    <div class="sub">色度图 → 和弦模板匹配（余弦相似度）→ 时序平滑 → 人工标注修正</div>
+  </div>
+  <div class="row">
+    <select id="fileSel" style="min-width:220px"></select>
+    <button class="btn-primary" id="loadBtn">识别</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>色度图（12 音级 × 时间）</h2>
+  <div class="plot"><canvas id="chroma" style="height:240px"></canvas></div>
+  <div class="row mt small muted">
+    <span>纵向为音级 C→B（自下而上）</span>
+    <span class="spacer"></span>
+    <span>时间 →</span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>和弦时间线</h2>
+  <div id="timeline" class="row" style="height:56px;align-items:stretch;border:1px solid var(--border);border-radius:8px;overflow:hidden"></div>
+  <div class="small muted mt">点击下方表格中的标签可人工修正，然后保存标注。</div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <h2 style="margin:0">和弦片段</h2>
+    <button class="btn-green" id="saveAnnot">💾 保存标注</button>
+  </div>
+  <table>
+    <thead><tr><th>开始</th><th>结束</th><th>和弦</th><th>置信度</th></tr></thead>
+    <tbody id="segTable"></tbody>
+  </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const ROOTS = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+const SUFFIX = [["", "大"], ["m", "小"], ["dim", "减"], ["aug", "增"], ["sus2", "挂二"],
+  ["sus4", "挂四"], ["maj7", "大七"], ["m7", "小七"], ["7", "属七"]];
+const CHORD_LABELS = [];
+for (const r of ROOTS) for (const [suf] of SUFFIX) CHORD_LABELS.push(r + suf);
+
+let chordData = null, annotations = [];
+
+async function loadFiles(selected) {
+  const files = await API.get("/api/library");
+  const sel = $("#fileSel");
+  sel.innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  if (selected) sel.value = selected;
+}
+
+function hueForRoot(label) {
+  const root = (label.match(/^[A-G]#?/) || ["C"])[0];
+  const idx = ROOTS.indexOf(root);
+  return idx >= 0 ? Math.round(idx / 12 * 360) : 0;
+}
+
+function drawChroma() {
+  const { ctx, w, h } = setupCanvas($("#chroma"));
+  ctx.clearRect(0, 0, w, h);
+  const chroma = chordData.chroma;
+  const frames = chroma.length;
+  if (!frames) return;
+  const gutter = 30, pw = w - gutter;
+  const img = ctx.createImageData(pw, h);
+  for (let y = 0; y < h; y++) {
+    const pc = 11 - Math.floor(y / h * 12);
+    for (let x = 0; x < pw; x++) {
+      const fr = Math.floor(x / pw * frames);
+      const [r, g, b] = colormap(chroma[fr][pc]);
+      const idx = (y * pw + x) * 4;
+      img.data[idx] = r; img.data[idx + 1] = g; img.data[idx + 2] = b; img.data[idx + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, gutter, 0);
+  ctx.fillStyle = "rgba(139,148,158,0.9)";
+  ctx.font = "10px monospace";
+  for (let pc = 0; pc < 12; pc++) {
+    const y = (11 - pc) / 12 * h + h / 24 + 3;
+    ctx.fillText(ROOTS[pc], 3, y);
+  }
+}
+
+function renderSegments() {
+  const segs = chordData.segments;
+  const total = chordData.times[chordData.times.length - 1] || 1;
+  $("#timeline").innerHTML = segs.map(s => {
+    const dur = Math.max(s.end - s.start, 0.001);
+    const hue = hueForRoot(s.label);
+    const txt = s.label === "N.C." ? "–" : s.label;
+    return `<div title="${s.label}" style="flex:${dur};background:hsl(${hue},55%,45%);color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;border-right:1px solid rgba(0,0,0,.3)">${txt}</div>`;
+  }).join("");
+
+  const opts = CHORD_LABELS.map(l => `<option ${l === "" ? "" : ""} value="${l}">${l === "" ? "N.C." : l}</option>`).join("");
+  $("#segTable").innerHTML = segs.map((s, i) => {
+    const conf = (chordData.confidence && chordData.confidence[i]) || 0;
+    return `<tr>
+      <td class="mono">${fmtTime(s.start)}</td>
+      <td class="mono">${fmtTime(s.end)}</td>
+      <td><select class="annot" data-i="${i}" style="min-width:90px">
+        ${opts.replace(`value="${esc(s.label)}"`, `value="${esc(s.label)}" selected`)}
+      </select></td>
+      <td class="mono">${conf.toFixed(2)}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function run() {
+  const id = $("#fileSel").value;
+  if (!id) return;
+  const btn = $("#loadBtn"); btn.disabled = true; btn.textContent = "识别中…";
+  try {
+    chordData = (await API.get(`/api/analyze/${id}/chords`)).data;
+    annotations = chordData.segments.map(s => ({ start: s.start, end: s.end, label: s.label }));
+    drawChroma();
+    renderSegments();
+  } catch (e) { toast(e.message, "error"); }
+  finally { btn.disabled = false; btn.textContent = "识别"; }
+}
+
+$("#loadBtn").onclick = run;
+$("#segTable").addEventListener("change", e => {
+  if (!e.target.classList.contains("annot")) return;
+  const i = +e.target.dataset.i;
+  annotations[i].label = e.target.value;
+});
+$("#saveAnnot").onclick = async () => {
+  const id = $("#fileSel").value;
+  await API.post(`/api/analyze/${id}/chords/annotate`, { annotations });
+  toast("标注已保存到 JSON", "success");
+};
+
+(async () => {
+  await loadFiles(new URLSearchParams(location.search).get("file"));
+  await run();
+})();
+</script>
+{% endblock %}

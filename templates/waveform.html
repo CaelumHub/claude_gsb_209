@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+{% block title %}波形编辑{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>波形显示与编辑</h1>
+    <div class="sub">最小/最大包络波形渲染 · 区域选择 · 裁剪/静音/淡化/增益/归一化/反转</div>
+  </div>
+  <div class="row">
+    <select id="fileSel" style="min-width:220px"></select>
+    <button class="btn-primary" id="loadBtn">加载</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <div class="row">
+      <button id="playBtn">▶ 播放</button>
+      <span id="timeLabel" class="mono muted">0:00.0 / 0:00.0</span>
+    </div>
+    <div class="row small muted">
+      <span id="selLabel">未选择区域（在波形上拖拽选择）</span>
+    </div>
+  </div>
+  <div class="plot"><canvas id="wave" style="height:230px"></canvas></div>
+  <div class="row mt small muted">
+    <span id="waveInfo"></span>
+    <span class="spacer"></span>
+    <div class="legend">
+      <span><span class="dot" style="background:var(--accent)"></span>波形包络</span>
+      <span><span class="dot" style="background:var(--accent);opacity:.3"></span>选区</span>
+      <span><span class="dot" style="background:var(--green)"></span>播放头</span>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>编辑操作</h2>
+  <div class="row">
+    <button id="opTrim">裁剪到选区</button>
+    <button id="opSilence">静音选区</button>
+    <button id="opNormalize">归一化</button>
+    <button id="opReverse">反转</button>
+    <button id="opFade">淡入淡出</button>
+    <button id="opGain">增益</button>
+    <label class="field inline">淡入(s) <input type="number" id="fadeIn" value="0.5" min="0" max="10" step="0.1" style="width:70px"/></label>
+    <label class="field inline">淡出(s) <input type="number" id="fadeOut" value="0.5" min="0" max="10" step="0.1" style="width:70px"/></label>
+    <label class="field inline">增益(dB) <input type="number" id="gainDb" value="6" min="-60" max="60" style="width:70px"/></label>
+  </div>
+  <div class="mt small muted">每个操作都会生成一个新文件（保留原文件），新文件可在下方结果中选择。</div>
+</div>
+
+<div class="card hidden" id="resultCard">
+  <h2>编辑结果</h2>
+  <div class="row" id="resultRow"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let env = null, selStart = null, selEnd = null, dragging = false;
+let currentId = null;
+const audio = new Audio();
+
+async function loadFiles(selected) {
+  const files = await API.get("/api/library");
+  const sel = $("#fileSel");
+  sel.innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  if (selected) sel.value = selected;
+}
+
+async function loadWave() {
+  const id = $("#fileSel").value;
+  if (!id) return;
+  currentId = id;
+  env = await API.get(`/api/audio/${id}/waveform?points=3000`);
+  selStart = selEnd = null;
+  audio.src = API.fileUrl(id);
+  $("#waveInfo").textContent =
+    `${env.duration.toFixed(2)}s · ${env.sr} Hz · ${env.channels} 声道 · ${env.points} 采样点`;
+  $("#timeLabel").textContent = `0:00.0 / ${fmtTime(env.duration)}`;
+  draw();
+}
+
+function draw() {
+  const c = $("#wave");
+  drawWaveform(c, env, {
+    selection: (selStart != null && selEnd != null) ? [Math.min(selStart, selEnd), Math.max(selStart, selEnd)] : null,
+    playhead: audio.duration ? audio.currentTime / audio.duration : null,
+  });
+}
+
+const wave = $("#wave");
+wave.addEventListener("mousedown", e => {
+  const r = wave.getBoundingClientRect();
+  dragging = true;
+  selStart = (e.clientX - r.left) / r.width;
+  selEnd = selStart;
+  draw();
+});
+window.addEventListener("mousemove", e => {
+  if (!dragging) return;
+  const r = wave.getBoundingClientRect();
+  selEnd = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+  updateSelLabel();
+  draw();
+});
+window.addEventListener("mouseup", () => { dragging = false; });
+
+function updateSelLabel() {
+  const a = Math.min(selStart, selEnd), b = Math.max(selStart, selEnd);
+  if (b - a < 0.001) { $("#selLabel").textContent = "未选择区域（在波形上拖拽选择）"; return; }
+  $("#selLabel").textContent = `选区 ${fmtTime(a * env.duration)} – ${fmtTime(b * env.duration)} (${((b - a) * env.duration).toFixed(2)}s)`;
+}
+
+$("#playBtn").addEventListener("click", () => {
+  if (audio.paused) { audio.play(); $("#playBtn").textContent = "⏸ 暂停"; }
+  else { audio.pause(); $("#playBtn").textContent = "▶ 播放"; }
+});
+audio.addEventListener("timeupdate", () => {
+  $("#timeLabel").textContent = `${fmtTime(audio.currentTime)} / ${fmtTime(audio.duration)}`;
+  draw();
+});
+
+function selectionParams() {
+  if (selStart == null || Math.abs(selEnd - selStart) < 0.001) return null;
+  const a = Math.min(selStart, selEnd) * env.duration;
+  const b = Math.max(selStart, selEnd) * env.duration;
+  return { start: a, end: b };
+}
+
+async function applyEdit(op, params) {
+  const body = { op, params, name: op + "-" + $("#fileSel").selectedOptions[0].text };
+  const entry = await API.post(`/api/audio/${currentId}/edit`, body);
+  toast("编辑完成，已生成新文件", "success");
+  await loadFiles(entry.id);
+  $("#resultCard").classList.remove("hidden");
+  $("#resultRow").innerHTML = `
+    <button class="btn-green" onclick="openResult('${entry.id}')">▶ 打开新文件</button>
+    <span class="muted">${esc(entry.name)} · ${fmtTime(entry.duration)}</span>`;
+}
+
+window.openResult = (id) => { $("#fileSel").value = id; loadWave(); };
+
+$("#opTrim").onclick = () => { const s = selectionParams(); if (!s) return toast("请先拖拽选择区域", "warn"); applyEdit("trim", s); };
+$("#opSilence").onclick = () => { const s = selectionParams(); if (!s) return toast("请先拖拽选择区域", "warn"); applyEdit("silence", s); };
+$("#opNormalize").onclick = () => applyEdit("normalize", { peak: 0.99 });
+$("#opReverse").onclick = () => applyEdit("reverse", {});
+$("#opFade").onclick = () => applyEdit("fade", { fade_in: +$("#fadeIn").value, fade_out: +$("#fadeOut").value });
+$("#opGain").onclick = () => applyEdit("gain", { gain_db: +$("#gainDb").value });
+$("#loadBtn").onclick = loadWave;
+
+(async () => {
+  await loadFiles(new URLSearchParams(location.search).get("file"));
+  await loadWave();
+})();
+</script>
+{% endblock %}

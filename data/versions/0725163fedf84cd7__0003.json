@@ -1,0 +1,19 @@
+{
+  "id": "0725163fedf84cd7",
+  "name": "测试项目2",
+  "created_at": "2026-10-02T22:30:03",
+  "updated_at": "2026-10-02T22:30:04",
+  "version": 3,
+  "tracks": [
+    {
+      "file_id": "973cfdba7902446a",
+      "gain": 1,
+      "muted": false,
+      "pan": 0
+    }
+  ],
+  "master": {
+    "gain": 0.8
+  },
+  "snapshot_at": "2026-10-02T22:30:04"
+}

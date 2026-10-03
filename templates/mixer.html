@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+{% block title %}混音台{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>混音台</h1>
+    <div class="sub">多轨混音 · 增益 / 声像 / 静音 · 主输出 · 项目配置存 JSON（每次修改自动版本化）</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <select id="projectSel" style="min-width:200px"></select>
+    <button class="btn-primary" id="newProject">+ 新建项目</button>
+    <label class="field inline">名称 <input type="text" id="projName" value="我的混音" style="width:160px"/></label>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <h2 style="margin:0">添加轨道</h2>
+    <div class="row">
+      <select id="fileSel" style="min-width:200px"></select>
+      <button class="btn-green" id="addTrack">+ 添加轨道</button>
+    </div>
+  </div>
+  <div id="tracks"></div>
+</div>
+
+<div class="card">
+  <div class="row between">
+    <div class="row">
+      <h2 style="margin:0">主输出</h2>
+      <label class="field inline">增益 <input type="range" id="masterGain" min="0" max="2" step="0.05" value="1"/><span id="masterVal" class="mono">1.00</span></label>
+    </div>
+    <button class="btn-green" id="mixBtn" style="font-size:15px;padding:10px 20px">▶ 混音导出</button>
+  </div>
+</div>
+
+<div class="card hidden" id="resultCard">
+  <h2>混音结果</h2>
+  <div id="resultRow" class="row"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let project = null, library = [], saving = false;
+
+async function loadLibrary() { library = await API.get("/api/library"); }
+
+function fileName(id) {
+  const f = library.find(x => x.id === id);
+  return f ? f.name : id;
+}
+
+async function loadProjects(selected) {
+  const projects = await API.get("/api/projects");
+  const sel = $("#projectSel");
+  sel.innerHTML = projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+  if (selected) sel.value = selected;
+  if (projects.length) {
+    const id = selected || projects[0].id;
+    sel.value = id;
+    await openProject(id);
+  } else {
+    project = null;
+    renderTracks();
+  }
+}
+
+async function openProject(id) {
+  project = await API.get("/api/projects/" + id);
+  $("#projName").value = project.name;
+  $("#masterGain").value = project.master?.gain ?? 1;
+  $("#masterVal").textContent = (+$("#masterGain").value).toFixed(2);
+  renderTracks();
+}
+
+function renderTracks() {
+  const box = $("#tracks");
+  if (!project || !project.tracks.length) {
+    box.innerHTML = `<div class="muted">项目还没有轨道 — 从上方添加。</div>`;
+    return;
+  }
+  box.innerHTML = project.tracks.map((t, i) => `
+    <div class="file-card row between mb">
+      <div style="min-width:220px" class="name">${esc(fileName(t.file_id))}</div>
+      <div class="row" style="flex:1">
+        <label class="field inline">增益
+          <input type="range" data-t="${i}" data-k="gain" min="0" max="2" step="0.02" value="${t.gain ?? 1}"/>
+          <span class="mono small">${(t.gain ?? 1).toFixed(2)}</span>
+        </label>
+        <label class="field inline">声像 L↔R
+          <input type="range" data-t="${i}" data-k="pan" min="-1" max="1" step="0.05" value="${t.pan ?? 0}"/>
+          <span class="mono small">${(t.pan ?? 0).toFixed(2)}</span>
+        </label>
+        <label class="field inline"><input type="checkbox" data-t="${i}" data-k="muted" ${t.muted ? "checked" : ""}/> 静音</label>
+      </div>
+      <button class="btn-sm btn-danger" data-del="${i}">✕</button>
+    </div>`).join("");
+}
+
+async function saveProject() {
+  if (!project || saving) return;
+  saving = true;
+  await API.put(`/api/projects/${project.id}`, project);
+  saving = false;
+}
+
+$("#tracks").addEventListener("input", e => {
+  const d = e.target.dataset;
+  if (d.t == null || !project) return;
+  const t = project.tracks[+d.t];
+  const val = d.k === "muted" ? e.target.checked : +e.target.value;
+  t[d.k] = val;
+  e.target.parentElement.querySelector("span") && (e.target.parentElement.querySelector("span").textContent = d.k === "muted" ? "" : val.toFixed(2));
+  saveProject();
+});
+$("#tracks").addEventListener("click", async e => {
+  if (e.target.dataset.del != null && project) {
+    project.tracks.splice(+e.target.dataset.del, 1);
+    renderTracks(); saveProject();
+  }
+});
+
+$("#addTrack").onclick = async () => {
+  const fid = $("#fileSel").value;
+  if (!project) return toast("请先新建或选择项目", "warn");
+  if (!fid) return toast("请选择要添加的音频", "warn");
+  project.tracks.push({ file_id: fid, gain: 1, pan: 0, muted: false });
+  renderTracks(); saveProject();
+  toast("已添加轨道", "success");
+};
+
+$("#newProject").onclick = async () => {
+  const p = await API.post("/api/projects", { name: $("#projName").value || "未命名项目", tracks: [] });
+  await loadProjects(p.id);
+  toast("已创建项目", "success");
+};
+
+$("#projectSel").onchange = e => openProject(e.target.value);
+$("#masterGain").oninput = e => {
+  $("#masterVal").textContent = (+e.target.value).toFixed(2);
+  if (project) { project.master = project.master || {}; project.master.gain = +e.target.value; saveProject(); }
+};
+
+$("#mixBtn").onclick = async () => {
+  if (!project || !project.tracks.length) return toast("请先添加轨道", "warn");
+  const btn = $("#mixBtn"); btn.disabled = true; btn.textContent = "混音中…";
+  try {
+    const entry = await API.post(`/api/projects/${project.id}/mix`, {});
+    $("#resultCard").classList.remove("hidden");
+    $("#resultRow").innerHTML = `
+      <button class="btn-sm" onclick="playFile('${entry.id}','${esc(entry.name)}')">▶ 播放</button>
+      <a class="btn btn-sm" href="${API.downloadUrl(entry.id)}">下载</a>
+      <span class="muted">${esc(entry.name)} · ${fmtTime(entry.duration)}</span>`;
+    toast("混音完成", "success");
+  } catch (e) { toast(e.message, "error"); }
+  finally { btn.disabled = false; btn.textContent = "▶ 混音导出"; }
+};
+
+(async () => {
+  await loadLibrary();
+  const files = library;
+  $("#fileSel").innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  await loadProjects();
+})();
+</script>
+{% endblock %}

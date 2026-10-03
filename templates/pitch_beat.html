@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}音高与节拍{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>音高与节拍检测</h1>
+    <div class="sub">自相关基频估计（YIN 备选） · 频谱通量起音 · 自相关速度估计与拍点跟踪</div>
+  </div>
+  <div class="row">
+    <select id="fileSel" style="min-width:220px"></select>
+    <button class="btn-primary" id="loadBtn">分析</button>
+  </div>
+</div>
+
+<div class="grid cols-2">
+  <div class="card">
+    <h2>音高（基频）轮廓</h2>
+    <div class="plot"><canvas id="pitch" style="height:200px"></canvas></div>
+    <div class="kv mt">
+      <span class="k">中位音高</span><span class="v" id="medianNote">--</span>
+      <span class="k">平均 f0</span><span class="v mono" id="meanF0">--</span>
+      <span class="k">有声比例</span><span class="v" id="voiced">--</span>
+      <span class="k">范围</span><span class="v mono" id="rangeF0">--</span>
+    </div>
+  </div>
+  <div class="card">
+    <h2>节拍与速度</h2>
+    <div class="kv mb">
+      <span class="k">BPM</span><span class="v" id="bpm" style="font-size:26px;color:var(--accent)">--</span>
+      <span class="k">拍数</span><span class="v" id="beatCount">--</span>
+    </div>
+    <div class="plot"><canvas id="beats" style="height:200px"></canvas></div>
+    <div class="legend mt">
+      <span><span class="dot" style="background:var(--accent)"></span>起音强度</span>
+      <span><span class="dot" style="background:var(--green)"></span>拍点</span>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <h2 style="margin:0">实时分析（麦克风）</h2>
+    <div class="row">
+      <button class="btn-green" id="micBtn">🎤 开始实时分析</button>
+    </div>
+  </div>
+  <div class="grid cols-2">
+    <div>
+      <div class="small muted mb">实时波形</div>
+      <div class="plot"><canvas id="liveWave" style="height:120px"></canvas></div>
+    </div>
+    <div>
+      <div class="small muted mb">实时频谱</div>
+      <div class="plot"><canvas id="liveSpec" style="height:120px"></canvas></div>
+    </div>
+  </div>
+  <div class="grid cols-4 mt" style="text-align:center">
+    <div class="file-card"><div class="k small muted">音高</div><div class="v" id="rtPitch" style="font-size:22px">--</div></div>
+    <div class="file-card"><div class="k small muted">音符</div><div class="v" id="rtNote" style="font-size:22px">--</div></div>
+    <div class="file-card"><div class="k small muted">电平</div><div class="v mono" id="rtLevel" style="font-size:22px">--</div></div>
+    <div class="file-card"><div class="k small muted">起音</div><div class="v mono" id="rtOnset" style="font-size:22px">--</div></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let pitchData = null, beatsData = null, stopMic = null;
+
+async function loadFiles(selected) {
+  const files = await API.get("/api/library");
+  const sel = $("#fileSel");
+  sel.innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  if (selected) sel.value = selected;
+}
+
+function drawBeats() {
+  if (!beatsData) return;
+  const { ctx, w, h } = setupCanvas($("#beats"));
+  ctx.clearRect(0, 0, w, h);
+  const onset = beatsData.onset, times = beatsData.times, beatTimes = beatsData.beats;
+  const mx = Math.max(...onset) || 1;
+  const pad = { l: 40, r: 10, t: 8, b: 16 };
+  const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
+  const xAt = i => pad.l + (onset.length <= 1 ? 0 : i / (onset.length - 1) * pw);
+  const yAt = v => pad.t + (1 - v / mx) * ph;
+
+  ctx.strokeStyle = "#58a6ff";
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  for (let i = 0; i < onset.length; i++) {
+    const x = xAt(i), y = yAt(onset[i]);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  const dur = times[times.length - 1] || 0;
+  ctx.strokeStyle = "#3fb950";
+  ctx.lineWidth = 1.6;
+  for (const bt of beatTimes) {
+    const x = pad.l + (dur ? bt / dur * pw : 0);
+    ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, pad.t + ph); ctx.stroke();
+  }
+}
+
+async function run() {
+  const id = $("#fileSel").value;
+  if (!id) return;
+  const btn = $("#loadBtn"); btn.disabled = true; btn.textContent = "分析中…";
+  try {
+    pitchData = (await API.get(`/api/analyze/${id}/pitch`)).data;
+    beatsData = (await API.get(`/api/analyze/${id}/beats`)).data;
+
+    drawLinePlot($("#pitch"), [{ data: pitchData.f0, color: "#58a6ff" }]);
+    const st = pitchData.stats;
+    $("#medianNote").textContent = st.median_note;
+    $("#meanF0").textContent = st.mean_f0.toFixed(1) + " Hz";
+    $("#voiced").textContent = (st.voiced_ratio * 100).toFixed(0) + "%";
+    $("#rangeF0").textContent = `${st.min_f0.toFixed(0)} – ${st.max_f0.toFixed(0)} Hz`;
+
+    $("#bpm").textContent = beatsData.tempo.toFixed(1);
+    $("#beatCount").textContent = beatsData.beats.length;
+    drawBeats();
+  } catch (e) { toast(e.message, "error"); }
+  finally { btn.disabled = false; btn.textContent = "分析"; }
+}
+
+$("#loadBtn").onclick = run;
+
+/* ---- realtime ---- */
+$("#micBtn").onclick = async () => {
+  if (stopMic) { stopMic(); stopMic = null; $("#micBtn").textContent = "🎤 开始实时分析"; return; }
+  try {
+    $("#micBtn").disabled = true;
+    stopMic = await startMic({
+      onLevel: (samples) => {
+        drawLiveWave($("#liveWave"), samples);
+        drawLiveSpectrum($("#liveSpec"), samples);
+      },
+      onFrame: async (samples, sr) => {
+        try {
+          const r = await API.post("/api/realtime/analyze", { samples, sr });
+          $("#rtPitch").textContent = r.pitch_hz ? r.pitch_hz.toFixed(1) + " Hz" : "--";
+          $("#rtNote").textContent = r.note;
+          $("#rtLevel").textContent = r.level_db.toFixed(1) + " dB";
+          $("#rtOnset").textContent = r.onset > 0.25 ? "●" : (r.onset > 0.1 ? "◐" : "○");
+          $("#rtOnset").style.color = r.onset > 0.25 ? "var(--green)" : "var(--text-muted)";
+        } catch (_) { /* ignore transient errors */ }
+      },
+    });
+    $("#micBtn").textContent = "⏹ 停止实时分析";
+  } catch (e) { toast(e.message, "error"); }
+  finally { $("#micBtn").disabled = false; }
+};
+
+(async () => {
+  await loadFiles(new URLSearchParams(location.search).get("file"));
+  await run();
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}音源分离{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>音源分离（模拟）</h1>
+    <div class="sub">谐波/打击（中值滤波 HPSS）· 人声/伴奏（中-侧分解）· 频段（低/中/高）</div>
+  </div>
+  <div class="row">
+    <select id="fileSel" style="min-width:220px"></select>
+  </div>
+</div>
+
+<div class="card">
+  <h2>分离模式</h2>
+  <div class="row">
+    <label class="field inline">
+      <input type="radio" name="mode" value="harmonic_percussive" checked /> 谐波 / 打击（HPSS）
+    </label>
+    <label class="field inline">
+      <input type="radio" name="mode" value="vocal_accompaniment" /> 人声 / 伴奏（中-侧）
+    </label>
+    <label class="field inline">
+      <input type="radio" name="mode" value="bands" /> 低频 / 中频 / 高频
+    </label>
+  </div>
+  <div class="row mt">
+    <label class="field inline">HPSS 处理时长上限(s)
+      <input type="number" id="maxSec" value="60" min="5" max="300" style="width:80px"/>
+    </label>
+    <button class="btn-primary" id="runBtn">开始分离</button>
+    <span id="status" class="muted small"></span>
+  </div>
+  <details class="help">
+    <summary>原理说明</summary>
+    HPSS 沿时间轴与频率轴对幅度谱做中值滤波，分别增强谐波（横向平滑）与打击（纵向平滑）分量，
+    再用软掩码结合原始相位经 ISTFT 重建两个音轨；中-侧分解将立体声分离为中心（人声）与两侧
+    （伴奏）；频段模式用双二阶滤波器切分低/中/高频。
+  </details>
+</div>
+
+<div class="card">
+  <h2>分离结果</h2>
+  <div id="results" class="muted">尚未运行分离。</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadFiles(selected) {
+  const files = await API.get("/api/library");
+  const sel = $("#fileSel");
+  sel.innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  if (selected) sel.value = selected;
+}
+
+const STEM_LABELS = {
+  harmonic: "谐波分量", percussive: "打击分量",
+  vocal: "人声（中心）", accompaniment: "伴奏（两侧）",
+  bass: "低频", mid: "中频", treble: "高频",
+};
+
+$("#runBtn").onclick = async () => {
+  const id = $("#fileSel").value;
+  const mode = document.querySelector("input[name=mode]:checked").value;
+  const btn = $("#runBtn"); btn.disabled = true;
+  $("#status").textContent = "处理中…（大文件可能需要数十秒）";
+  $("#results").textContent = "";
+  try {
+    const r = await API.post(`/api/separation/${id}`, { mode, max_seconds: +$("#maxSec").value });
+    $("#status").textContent = "完成";
+    $("#results").innerHTML = Object.entries(r).map(([k, entry]) => `
+      <div class="file-card row between mb">
+        <div>
+          <div class="name">${STEM_LABELS[k] || k} — ${esc(entry.name)}</div>
+          <div class="meta">${fmtTime(entry.duration)} · ${entry.sr} Hz · ${entry.channels} 声道</div>
+        </div>
+        <div class="row">
+          <button class="btn-sm" onclick="playFile('${entry.id}','${esc(entry.name)}')">▶ 播放</button>
+          <a class="btn btn-sm" href="${API.downloadUrl(entry.id)}">下载</a>
+        </div>
+      </div>`).join("");
+    toast("分离完成", "success");
+  } catch (e) {
+    $("#status").textContent = "";
+    toast(e.message, "error");
+  } finally { btn.disabled = false; }
+};
+
+loadFiles(new URLSearchParams(location.search).get("file"));
+</script>
+{% endblock %}

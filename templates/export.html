@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}导出与转换{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>导出与格式转换</h1>
+    <div class="sub">WAV / AIFF / RAW / MP3 / OGG / FLAC / M4A · 采样率 / 位深 / 声道 · 流式重采样</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>导出设置</h2>
+  <div class="grid cols-2">
+    <label class="field">源文件
+      <select id="fileSel"></select>
+    </label>
+    <label class="field">目标格式
+      <select id="fmt">
+        <option value="wav">WAV (PCM)</option>
+        <option value="aiff">AIFF</option>
+        <option value="raw">RAW (PCM headerless)</option>
+        <option value="mp3">MP3</option>
+        <option value="ogg">OGG / Vorbis</option>
+        <option value="flac">FLAC</option>
+        <option value="m4a">M4A / AAC</option>
+      </select>
+    </label>
+    <label class="field">采样率
+      <select id="sr">
+        <option value="">保持原始</option>
+        <option value="8000">8000</option>
+        <option value="16000">16000</option>
+        <option value="22050">22050</option>
+        <option value="44100">44100</option>
+        <option value="48000">48000</option>
+      </select>
+    </label>
+    <label class="field">位深（仅 WAV）
+      <select id="bits">
+        <option value="pcm16">16-bit PCM</option>
+        <option value="pcm24">24-bit PCM</option>
+        <option value="pcm8">8-bit PCM</option>
+        <option value="float32">32-bit float</option>
+      </select>
+    </label>
+    <label class="field">声道
+      <select id="ch">
+        <option value="">保持原始</option>
+        <option value="1">单声道</option>
+        <option value="2">立体声</option>
+      </select>
+    </label>
+    <label class="field">比特率（MP3/M4A）
+      <select id="bitrate">
+        <option value="128k">128 kbps</option>
+        <option value="192k" selected>192 kbps</option>
+        <option value="256k">256 kbps</option>
+        <option value="320k">320 kbps</option>
+      </select>
+    </label>
+  </div>
+  <div class="row mt">
+    <button class="btn-primary" id="exportBtn">开始导出</button>
+    <span id="status" class="muted small"></span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>已导出文件</h2>
+  <table>
+    <thead><tr><th>名称</th><th>格式</th><th>时长</th><th>采样率</th><th>大小</th><th>操作</th></tr></thead>
+    <tbody id="exported"></tbody>
+  </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadFiles(selected) {
+  const files = await API.get("/api/library");
+  $("#fileSel").innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  if (selected) $("#fileSel").value = selected;
+  loadExported();
+}
+
+async function loadExported() {
+  const files = await API.get("/api/library");
+  const exp = files.filter(f => f.exported).slice(0, 20);
+  $("#exported").innerHTML = exp.map(f => `
+    <tr>
+      <td class="name">${esc(f.name)}</td>
+      <td><span class="badge amber">${(f.original_format || "?").toUpperCase()}</span></td>
+      <td class="mono">${fmtTime(f.duration)}</td>
+      <td class="mono">${f.sr || "--"} Hz</td>
+      <td>${fmtBytes(f.size_bytes)}</td>
+      <td><a class="btn btn-sm" href="${API.downloadUrl(f.id)}">下载</a></td>
+    </tr>`).join("") || `<tr><td colspan="6" class="muted">还没有导出记录。</td></tr>`;
+}
+
+$("#exportBtn").onclick = async () => {
+  const id = $("#fileSel").value;
+  if (!id) return toast("请选择文件", "warn");
+  const body = {
+    file_id: id,
+    format: $("#fmt").value,
+    sample_rate: $("#sr").value ? +$("#sr").value : null,
+    bit_depth: $("#bits").value,
+    channels: $("#ch").value ? +$("#ch").value : null,
+    bitrate: $("#bitrate").value,
+  };
+  const btn = $("#exportBtn"); btn.disabled = true;
+  $("#status").textContent = "导出中…（压缩格式经 ffmpeg 编码）";
+  try {
+    const entry = await API.post("/api/export", body);
+    $("#status").textContent = "";
+    toast("导出完成: " + entry.name, "success");
+    loadExported();
+  } catch (e) { $("#status").textContent = ""; toast(e.message, "error"); }
+  finally { btn.disabled = false; }
+};
+
+loadFiles(new URLSearchParams(location.search).get("file"));
+</script>
+{% endblock %}

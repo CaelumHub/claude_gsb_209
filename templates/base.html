@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}{{ pages.get(active, '音频处理') }}{% endblock %} · 音频处理与音乐信息检索</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+  {% block head %}{% endblock %}
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><span class="logo">♪</span><span>音频 MIR 系统</span></div>
+    <nav class="nav">
+      {% set items = [
+        ('library', '♪', '音频库'),
+        ('waveform', '〰', '波形编辑'),
+        ('spectrogram', '📊', '频谱分析'),
+        ('pitch_beat', '🎵', '音高与节拍'),
+        ('chords', '🎼', '和弦识别'),
+        ('separation', '🔀', '音源分离'),
+        ('effects', '🎛', '效果链'),
+        ('mixer', '🎚', '混音台'),
+        ('export', '💾', '导出与转换'),
+        ('history', '🕘', '项目历史'),
+      ] %}
+      {% for key, ico, label in items %}
+        <a href="/{{ key }}" class="{{ 'active' if active == key else '' }}">
+          <span class="ico">{{ ico }}</span><span>{{ label }}</span>
+        </a>
+      {% endfor %}
+    </nav>
+    <div class="faint small" style="margin-top:20px;padding:0 8px;">
+      纯 Python 自实现 DSP<br/>Flask · JSON 存储 · 文件锁
+    </div>
+  </aside>
+
+  <main class="main">
+    {% block content %}{% endblock %}
+  </main>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/common.js"></script>
+<script src="/static/js/audio.js"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

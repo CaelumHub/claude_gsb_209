@@ -1,0 +1,211 @@
+{% extends "base.html" %}
+{% block title %}效果链{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>效果链</h1>
+    <div class="sub">均衡 / 压缩 / 混响 / 延迟 / 失真 / 合唱 — 流式处理，可预览与整段应用</div>
+  </div>
+  <div class="row">
+    <select id="fileSel" style="min-width:220px"></select>
+  </div>
+</div>
+
+<div class="card">
+  <h2>添加效果</h2>
+  <div class="row" id="catalogRow"></div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <h2 style="margin:0">效果链</h2>
+    <div class="row">
+      <select id="presetSel" style="min-width:150px"><option value="">预设…</option></select>
+      <button class="btn-sm" id="applyPreset">应用预设</button>
+      <button class="btn-sm btn-danger" id="clearChain">清空</button>
+    </div>
+  </div>
+  <div id="chainList"></div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <h2 style="margin:0">预览与导出</h2>
+    <div class="row">
+      <button class="btn-primary" id="previewBtn">▶ 预览前 6 秒</button>
+      <button class="btn-green" id="applyBtn">应用到整个文件</button>
+    </div>
+  </div>
+  <div class="row">
+    <button id="playPreview" class="hidden">▶ 播放预览</button>
+    <span id="previewInfo" class="muted small"></span>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let catalog = [], chain = [], presets = [], previewWav = null;
+
+async function loadFiles(selected) {
+  const files = await API.get("/api/library");
+  const sel = $("#fileSel");
+  sel.innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  if (selected) sel.value = selected;
+}
+
+function defaultParams(effect) {
+  const p = {};
+  for (const param of effect.params) {
+    if (param.enum) p[param.name] = param.default;
+    else p[param.name] = param.default ?? param.min ?? 0;
+  }
+  if (effect.type === "eq") p.bands = [{ type: "peaking", freq: 1000, gain: 0, q: 1 }];
+  return p;
+}
+
+function addEffect(type) {
+  const eff = catalog.find(e => e.type === type);
+  chain.push({ type, enabled: true, params: defaultParams(eff) });
+  renderChain();
+}
+
+function paramControl(eff, param, value, idx) {
+  const pid = `${idx}-${param.name}`;
+  if (param.enum) {
+    return `<label class="field"><span>${param.label}</span>
+      <select data-p="${pid}">${param.enum.map(o =>
+        `<option ${o === value ? "selected" : ""}>${o}</option>`).join("")}</select></label>`;
+  }
+  return `<label class="field">
+    <span>${param.label} <b class="faint mono">${value}</b></span>
+    <input type="range" data-p="${pid}" min="${param.min}" max="${param.max}" step="${param.step}" value="${value}" />
+  </label>`;
+}
+
+function renderChain() {
+  const box = $("#chainList");
+  if (!chain.length) { box.innerHTML = `<div class="muted">链为空 — 从上方添加效果。</div>`; return; }
+  box.innerHTML = chain.map((fx, i) => {
+    const eff = catalog.find(e => e.type === fx.type) || { label: fx.type, params: [] };
+    let controls;
+    if (fx.type === "eq") {
+      controls = `<div style="grid-column:1/-1">
+        <div class="row between"><span class="small muted">均衡频段</span>
+        <button class="btn-sm" data-addband="${i}">+ 频段</button></div>
+        ${fx.params.bands.map((b, bi) => `
+          <div class="row" style="margin-top:6px">
+            <select data-band="${i}-${bi}-type" style="min-width:96px">
+              ${["peaking","lowshelf","highshelf","lowpass","highpass","notch","bandpass"].map(t =>
+                `<option ${t === b.type ? "selected" : ""}>${t}</option>`).join("")}
+            </select>
+            <label class="field inline">f <input type="range" data-band="${i}-${bi}-freq" min="20" max="18000" step="10" value="${b.freq}" style="width:110px"/><span class="mono small">${b.freq}</span></label>
+            <label class="field inline">G <input type="range" data-band="${i}-${bi}-gain" min="-18" max="18" step="0.5" value="${b.gain}" style="width:90px"/><span class="mono small">${b.gain}</span></label>
+            <label class="field inline">Q <input type="range" data-band="${i}-${bi}-q" min="0.1" max="8" step="0.1" value="${b.q}" style="width:80px"/><span class="mono small">${b.q}</span></label>
+            <button class="btn-sm btn-danger" data-delband="${i}-${bi}">✕</button>
+          </div>`).join("")}
+      </div>`;
+    } else {
+      controls = eff.params.map(p => paramControl(eff, p, fx.params[p.name], i)).join("");
+    }
+    return `<div class="file-card mb" data-i="${i}">
+      <div class="row between mb">
+        <div class="row">
+          <label class="field inline"><input type="checkbox" data-enable="${i}" ${fx.enabled ? "checked" : ""}/> 启用</label>
+          <strong>${eff.label}</strong>
+        </div>
+        <div class="row">
+          <button class="btn-sm" data-move="${i}-up">↑</button>
+          <button class="btn-sm" data-move="${i}-down">↓</button>
+          <button class="btn-sm btn-danger" data-remove="${i}">✕</button>
+        </div>
+      </div>
+      <div class="grid cols-2">${controls}</div>
+    </div>`;
+  }).join("");
+}
+
+/* Event delegation for the chain. */
+$("#chainList").addEventListener("input", e => {
+  const d = e.target.dataset;
+  if (d.enable != null) chain[+d.enable].enabled = e.target.checked;
+  else if (d.p) {
+    const [i, name] = d.p.split("-").map((x, j) => j === 0 ? +x : x);
+    const eff = catalog.find(c => c.type === chain[i].type);
+    const param = eff.params.find(p => p.name === name);
+    const val = param.enum ? e.target.value : +e.target.value;
+    chain[i].params[name] = val;
+    e.target.parentElement.querySelector("b").textContent = val;
+  } else if (d.band) {
+    const [i, bi, key] = d.band.split("-");
+    chain[+i].params.bands[+bi][key === "freq" ? "freq" : key === "gain" ? "gain" : "q"] = +e.target.value;
+    e.target.parentElement.querySelector("span").textContent = +e.target.value;
+  }
+});
+$("#chainList").addEventListener("click", e => {
+  const d = e.target.dataset;
+  if (d.remove != null) { chain.splice(+d.remove, 1); renderChain(); }
+  else if (d.move) {
+    const [i, dir] = d.move.split("-").map((x, j) => j === 0 ? +x : x);
+    const j = dir === "up" ? i - 1 : i + 1;
+    if (j >= 0 && j < chain.length) { [chain[i], chain[j]] = [chain[j], chain[i]]; renderChain(); }
+  } else if (d.addband != null) { chain[+d.addband].params.bands.push({ type: "peaking", freq: 1000, gain: 0, q: 1 }); renderChain(); }
+  else if (d.delband) {
+    const [i, bi] = d.delband.split("-").map(Number);
+    chain[i].params.bands.splice(bi, 1); renderChain();
+  }
+});
+
+$("#clearChain").onclick = () => { chain = []; previewWav = null; renderChain(); };
+$("#applyPreset").onclick = () => {
+  const name = $("#presetSel").value;
+  if (!name) return;
+  const p = presets.find(x => x.name === name);
+  chain = JSON.parse(JSON.stringify(p.chain));
+  renderChain();
+  toast("已应用预设: " + name, "success");
+};
+
+$("#previewBtn").onclick = async () => {
+  const id = $("#fileSel").value;
+  if (!id) return toast("请先选择文件", "warn");
+  const btn = $("#previewBtn"); btn.disabled = true;
+  try {
+    const r = await API.post("/api/effects/preview", { file_id: id, chain, start: 0, duration: 6 });
+    previewWav = r.wav;
+    $("#playPreview").classList.remove("hidden");
+    $("#previewInfo").textContent = `预览已渲染（${fmtBytes(r.size)}）`;
+    playBase64Wav(previewWav);
+  } catch (e) { toast(e.message, "error"); }
+  finally { btn.disabled = false; }
+};
+$("#playPreview").onclick = () => { if (previewWav) playBase64Wav(previewWav); };
+
+$("#applyBtn").onclick = async () => {
+  const id = $("#fileSel").value;
+  if (!id) return toast("请先选择文件", "warn");
+  if (!chain.length) return toast("效果链为空", "warn");
+  const btn = $("#applyBtn"); btn.disabled = true; btn.textContent = "处理中…";
+  try {
+    const entry = await API.post("/api/effects/apply", { file_id: id, chain });
+    toast("已应用效果，生成新文件: " + entry.name, "success");
+    $("#previewInfo").textContent = "新文件已加入音频库。";
+  } catch (e) { toast(e.message, "error"); }
+  finally { btn.disabled = false; btn.textContent = "应用到整个文件"; }
+};
+
+(async () => {
+  catalog = await API.get("/api/effects/catalog");
+  presets = await API.get("/api/effects/presets");
+  $("#catalogRow").innerHTML = catalog.map(e =>
+    `<button data-add="${e.type}">+ ${e.label}</button>`).join("");
+  $("#presetSel").innerHTML = `<option value="">预设…</option>` + presets.map(p =>
+    `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
+  $("#catalogRow").addEventListener("click", e => {
+    if (e.target.dataset.add) addEffect(e.target.dataset.add);
+  });
+  await loadFiles(new URLSearchParams(location.search).get("file"));
+  renderChain();
+})();
+</script>
+{% endblock %}

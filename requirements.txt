@@ -1,0 +1,11 @@
+# Audio Processing & Music Information Retrieval system
+#
+# The entire DSP/MIR backend is self-implemented in pure Python (standard
+# library only: math, cmath, wave, struct, fcntl, json, ...).  The only hard
+# dependency is the web framework:
+Flask>=2.0
+flask-cors>=4.0     # optional — the app falls back gracefully if absent
+
+# Optional (NOT required): ffmpeg is used at runtime for decoding/encoding
+# compressed formats (mp3/ogg/flac/m4a).  Install it via your OS package
+# manager, e.g.  `sudo apt install ffmpeg`.

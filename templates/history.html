@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}项目历史{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>项目历史与版本</h1>
+    <div class="sub">每次项目修改自动快照 · 可回滚 · 音频文件派生链追踪</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row mb">
+    <select id="projectSel" style="min-width:220px"></select>
+    <button class="btn-primary" id="reload">加载版本</button>
+  </div>
+  <div class="row">
+    <div class="kv"><span class="k">当前版本</span><span class="v" id="curVersion">--</span></div>
+    <div class="kv"><span class="k">更新时间</span><span class="v" id="curUpdated">--</span></div>
+    <div class="kv"><span class="k">轨道数</span><span class="v" id="curTracks">--</span></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>项目版本历史</h2>
+  <table>
+    <thead><tr><th>版本</th><th>时间</th><th>轨道数</th><th>说明</th><th>操作</th></tr></thead>
+    <tbody id="versionList"></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>音频文件派生链</h2>
+  <div class="row mb">
+    <select id="fileSel"></select>
+    <button class="btn-primary" id="loadChain">查看派生链</button>
+  </div>
+  <div id="chain"></div>
+</div>
+
+<div class="card">
+  <h2>系统统计</h2>
+  <div id="stats" class="row"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadProjects(selected) {
+  const projects = await API.get("/api/projects");
+  const sel = $("#projectSel");
+  sel.innerHTML = projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+  if (selected) sel.value = selected;
+  if (projects.length) {
+    sel.value = selected || projects[0].id;
+    loadVersions(sel.value);
+  }
+}
+
+async function loadVersions(id) {
+  if (!id) return;
+  const p = await API.get("/api/projects/" + id);
+  const vers = await API.get(`/api/projects/${id}/versions`);
+  $("#curVersion").textContent = "v" + p.version;
+  $("#curUpdated").textContent = p.updated_at;
+  $("#curTracks").textContent = p.tracks.length;
+
+  $("#versionList").innerHTML = vers.slice().reverse().map(v => `
+    <tr>
+      <td class="mono">v${v.version}${v.version === p.version ? ' <span class="badge green">当前</span>' : ""}</td>
+      <td>${v.updated_at || v.snapshot_at}</td>
+      <td>${v.tracks ? v.tracks.length : "-"}</td>
+      <td class="small muted">${v.reverted_from ? `由 v${v.reverted_from} 回滚` : (v.version === 1 ? "初始创建" : "修改")}</td>
+      <td>
+        ${v.version !== p.version ? `<button class="btn-sm" onclick="revert(${v.version})">回滚到此版本</button>` : ""}
+      </td>
+    </tr>`).join("");
+}
+
+window.revert = async (version) => {
+  const id = $("#projectSel").value;
+  if (!confirm(`回滚到版本 v${version}？将生成一个新版本快照。`)) return;
+  await API.post(`/api/projects/${id}/revert`, { version });
+  toast("已回滚", "success");
+  loadVersions(id);
+};
+
+$("#projectSel").onchange = e => loadVersions(e.target.value);
+$("#reload").onclick = () => loadVersions($("#projectSel").value);
+
+async function loadFiles(selected) {
+  const files = await API.get("/api/library");
+  $("#fileSel").innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  if (selected) $("#fileSel").value = selected;
+}
+
+$("#loadChain").onclick = async () => {
+  const id = $("#fileSel").value;
+  if (!id) return;
+  const chain = await API.get(`/api/versions/${id}`);
+  $("#chain").innerHTML = chain.map((f, i) => `
+    <div class="file-card row between mb" style="${i === 0 ? 'border-color:var(--accent)' : ''}">
+      <div>
+        <div class="name">${i === 0 ? '▶ ' : ''}${esc(f.name)}</div>
+        <div class="meta">${fmtTime(f.duration)} · ${f.sr} Hz · ${fmtBytes(f.size_bytes)} · ${f.uploaded_at}</div>
+      </div>
+      <div class="row">
+        ${f.derived_from ? `<span class="badge">派生自上一级</span>` : `<span class="badge neutral">原始</span>`}
+        <button class="btn-sm" onclick="playFile('${f.id}','${esc(f.name)}')">▶</button>
+      </div>
+    </div>`).join("") || `<div class="muted">无数据。</div>`;
+};
+
+(async () => {
+  const stats = await API.get("/api/stats");
+  $("#stats").innerHTML = [
+    ["音频文件", stats.files], ["总大小", fmtBytes(stats.total_bytes)],
+    ["分析结果", stats.analyses], ["项目", stats.projects], ["版本快照", stats.versions],
+    ["ffmpeg", stats.has_ffmpeg ? "可用" : "缺失"],
+  ].map(([k, v]) => `<div class="file-card" style="text-align:center"><div class="k small muted">${k}</div><div class="v" style="font-size:20px">${v}</div></div>`).join("");
+  await loadProjects();
+  await loadFiles();
+})();
+</script>
+{% endblock %}

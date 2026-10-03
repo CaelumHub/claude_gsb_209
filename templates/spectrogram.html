@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}频谱分析{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>频谱图与声谱分析</h1>
+    <div class="sub">STFT 短时傅里叶变换 · dB 声谱图 · 频谱质心/滚降/平坦度/通量/能量</div>
+  </div>
+  <div class="row">
+    <select id="fileSel" style="min-width:220px"></select>
+    <button class="btn-primary" id="loadBtn">分析</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <h2 style="margin:0">声谱图</h2>
+    <span id="specInfo" class="muted small"></span>
+  </div>
+  <div class="plot"><canvas id="spec" style="height:300px"></canvas></div>
+  <div class="row mt small muted">
+    <span>频率 0 – 20 kHz（向上）</span>
+    <span class="spacer"></span>
+    <span>时间 →</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <h2 style="margin:0">频谱特征</h2>
+    <div class="row small">
+      <label class="field inline"><input type="checkbox" id="fCentroid" checked />质心</label>
+      <label class="field inline"><input type="checkbox" id="fRolloff" checked />滚降</label>
+      <label class="field inline"><input type="checkbox" id="fFlat" checked />平坦度</label>
+      <label class="field inline"><input type="checkbox" id="fFlux" checked />通量</label>
+      <label class="field inline"><input type="checkbox" id="fRms" checked />RMS</label>
+      <label class="field inline"><input type="checkbox" id="fZcr" checked />过零率</label>
+    </div>
+  </div>
+  <div class="plot"><canvas id="features" style="height:220px"></canvas></div>
+  <div class="legend mt" id="featureLegend"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let spectral = null;
+
+async function loadFiles(selected) {
+  const files = await API.get("/api/library");
+  const sel = $("#fileSel");
+  sel.innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  if (selected) sel.value = selected;
+}
+
+function drawFeatures() {
+  if (!spectral) return;
+  const s = spectral;
+  const defs = [
+    ["fCentroid", s.centroid, "质心", "#58a6ff"],
+    ["fRolloff", s.rolloff, "滚降", "#bc8cff"],
+    ["fFlat", s.flatness, "平坦度", "#39c5cf"],
+    ["fFlux", s.flux, "通量", "#d29922"],
+    ["fRms", s.rms, "RMS", "#3fb950"],
+    ["fZcr", s.zcr, "过零率", "#f85149"],
+  ];
+  const series = [];
+  const legend = [];
+  for (const [id, data, name, color] of defs) {
+    if (!$("#" + id).checked || !data || !data.length) continue;
+    const mn = Math.min(...data), mx = Math.max(...data);
+    const norm = (mx - mn) < 1e-9 ? data.map(() => 0.5) : data.map(v => (v - mn) / (mx - mn));
+    series.push({ data: norm, color });
+    legend.push(`<span><span class="dot" style="background:${color}"></span>${name} [${fmtVal(mn)} – ${fmtVal(mx)}]</span>`);
+  }
+  $("#featureLegend").innerHTML = legend.join("");
+  drawLinePlot($("#features"), series);
+}
+
+async function run() {
+  const id = $("#fileSel").value;
+  if (!id) return;
+  const btn = $("#loadBtn");
+  btn.disabled = true; btn.textContent = "分析中…";
+  try {
+    const spec = (await API.get(`/api/analyze/${id}/spectrogram`)).data;
+    spectral = (await API.get(`/api/analyze/${id}/spectral`)).data;
+    drawSpectrogram($("#spec"), spec);
+    $("#specInfo").textContent =
+      `${spec.times.length} 时间帧 × ${spec.freqs.length} 频带 · nfft=${spec.nfft} · hop=${spec.hop}`;
+    drawFeatures();
+  } catch (e) { toast(e.message, "error"); }
+  finally { btn.disabled = false; btn.textContent = "分析"; }
+}
+
+$$("#features, #fCentroid, #fRolloff, #fFlat, #fFlux, #fRms, #fZcr").forEach(el => {
+  if (el.type === "checkbox") el.addEventListener("change", drawFeatures);
+});
+$("#loadBtn").onclick = run;
+
+(async () => {
+  await loadFiles(new URLSearchParams(location.search).get("file"));
+  await run();
+})();
+</script>
+{% endblock %}
