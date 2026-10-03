@@ -841,33 +841,53 @@ class StreamingResampler:
         self.ratio = src_sr / dst_sr
         self.pos = 0.0
         self.buf: List[float] = []
+        self._input_frames = 0
+        self._output_frames = 0
 
     def push(self, block: Sequence[float]) -> None:
         self.buf.extend(block)
+        self._input_frames += len(block)
+
+    def _target_output_frames(self) -> int:
+        if self.ratio <= 0:
+            return 0
+        # Number of destination samples covering the source duration.
+        return max(0, math.ceil(self._input_frames / self.ratio - 1e-9))
+
+    def _interpolate(self, pos: float) -> float:
+        i0 = int(pos)
+        frac = pos - i0
+        if i0 + 1 < len(self.buf):
+            return self.buf[i0] * (1.0 - frac) + self.buf[i0 + 1] * frac
+        return self.buf[i0]
 
     def pull(self, max_out: int) -> List[float]:
+        target = min(max_out, max(0, self._target_output_frames() - self._output_frames))
         out: List[float] = []
-        buf = self.buf
         ratio = self.ratio
-        pos = self.pos
-        n = len(buf)
-        while len(out) < max_out and int(pos) + 1 < n:
-            i0 = int(pos)
-            frac = pos - i0
-            out.append(buf[i0] * (1.0 - frac) + buf[i0 + 1] * frac)
-            pos += ratio
-        consumed = int(pos)
+        while len(out) < target and int(self.pos) < len(self.buf):
+            out.append(self._interpolate(self.pos))
+            self.pos += ratio
+        consumed = int(self.pos)
         if consumed > 0:
-            del buf[:consumed]
-            pos -= consumed
-        self.pos = pos
+            del self.buf[:consumed]
+            self.pos -= consumed
+        self._output_frames += len(out)
         return out
 
     def flush(self, max_out: int) -> List[float]:
         """Pull any remaining samples, including a final partial one."""
-        if not self.buf:
-            return []
-        return self.pull(max_out)
+        target = min(max_out, max(0, self._target_output_frames() - self._output_frames))
+        out: List[float] = []
+        while len(out) < target and int(self.pos) < len(self.buf):
+            out.append(self._interpolate(self.pos))
+            self.pos += self.ratio
+        consumed = int(self.pos)
+        if consumed > 0:
+            del self.buf[:consumed]
+            self.pos -= consumed
+        self._output_frames += len(out)
+        return out
 
 
 def fade_in_out(samples: Sequence[float], fade_sec: float, sr: float) -> List[float]:

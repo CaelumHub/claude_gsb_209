@@ -18,9 +18,10 @@ import math
 import os
 import shutil
 import tempfile
-from typing import Dict, Optional
+from contextlib import contextmanager
+from typing import Dict, Iterator, Optional
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, Response, jsonify, render_template, request, send_file
 
 from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, storage
 
@@ -49,6 +50,30 @@ rt = realtime.new_analyzer()
 
 def _abs_path(entry: Dict) -> str:
     return os.path.join(DATA_DIR, entry["path"])
+
+
+@contextmanager
+def _readable_audio(entry: Dict) -> Iterator[str]:
+    """Return a WAV path for code paths that only understand WAV."""
+    path = _abs_path(entry)
+    if entry.get("original_format") != "raw":
+        yield path
+        return
+
+    fd, tmp = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        audio_io.raw_to_wav(
+            path,
+            tmp,
+            int(entry.get("sr") or 0),
+            int(entry.get("channels") or 0),
+            int(entry.get("sample_width") or 2),
+        )
+        yield tmp
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def _entry(file_id: str) -> Optional[Dict]:
@@ -262,7 +287,30 @@ def api_audio(file_id: str):
     entry = _entry(file_id)
     if not entry:
         return jsonify(error="file not found"), 404
-    return send_file(_abs_path(entry), mimetype="audio/wav")
+    path = _abs_path(entry)
+    if entry.get("original_format") != "raw":
+        return send_file(path, conditional=True)
+
+    sr = int(entry.get("sr") or 0)
+    channels = int(entry.get("channels") or 0)
+    sample_width = int(entry.get("sample_width") or 2)
+    if sr <= 0 or channels <= 0:
+        return jsonify(error="RAW audio metadata is incomplete"), 500
+    size = os.path.getsize(path)
+    header = audio_io.build_wav_header(sr, channels, sample_width, size)
+
+    def generate():
+        yield header
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                yield chunk
+
+    return Response(generate(), mimetype="audio/wav",
+                    headers={"Content-Length": str(len(header) + size),
+                             "Accept-Ranges": "none"})
 
 
 @app.get("/api/download/<file_id>")
@@ -280,7 +328,11 @@ def api_waveform(file_id: str):
         return jsonify(error="file not found"), 404
     points = int(request.args.get("points", 2000))
     channel = int(request.args.get("channel", 0))
-    return jsonify(analysis.waveform_envelope(_abs_path(entry), points=points, channel=channel))
+    fmt = entry.get("original_format")
+    return jsonify(analysis.waveform_envelope(
+        _abs_path(entry), points=points, channel=channel, fmt=fmt,
+        sr=entry.get("sr"), channels=entry.get("channels"),
+        sample_width=entry.get("sample_width", 2)))
 
 
 @app.get("/api/audio/<file_id>/samples")
@@ -292,7 +344,12 @@ def api_samples(file_id: str):
     start = float(request.args.get("start", 0.0))
     duration = float(request.args.get("duration", 5.0))
     max_n = int(request.args.get("max", 50000))
-    with audio_io.WavReader(_abs_path(entry)) as r:
+    fmt = entry.get("original_format")
+    raw_params = {}
+    if fmt == "raw":
+        raw_params = {"sr": entry.get("sr"), "channels": entry.get("channels"),
+                      "sample_width": entry.get("sample_width", 2)}
+    with audio_io.open_reader(_abs_path(entry), fmt, **raw_params) as r:
         sr = r.sr
         start_f = max(0, int(start * sr))
         n = min(max_n, int(duration * sr))
@@ -387,7 +444,8 @@ def api_edit(file_id: str):
 
     file_id_new = storage.new_id()
     dst = os.path.join(store.audio_dir, file_id_new + ".wav")
-    _apply_edit(_abs_path(entry), dst, op, data.get("params", {}))
+    with _readable_audio(entry) as src:
+        _apply_edit(src, dst, op, data.get("params", {}))
     new_entry = _register_derived(entry["id"], name, dst, {"op": op})
     return jsonify(new_entry)
 
@@ -421,7 +479,8 @@ def api_analyze(file_id: str, kind: str):
         if cached:
             return jsonify(cached)
     try:
-        data = _run_analysis(kind, _abs_path(entry))
+        with _readable_audio(entry) as path:
+            data = _run_analysis(kind, path)
     except ValueError as e:
         return jsonify(error=str(e)), 400
     doc = store.save_analysis(file_id, kind, data, {"kind": kind})
@@ -454,29 +513,30 @@ def api_separate(file_id: str):
 
     tmp = tempfile.mkdtemp()
     try:
-        if mode == "harmonic_percussive":
-            p_h = os.path.join(tmp, "harmonic.wav")
-            p_p = os.path.join(tmp, "percussive.wav")
-            separation.hpss_separate(_abs_path(entry), p_h, p_p, max_seconds=max_seconds)
-            h = _register_derived(entry["id"], f"harmonic-{entry['name']}", p_h, {"separation": mode})
-            p = _register_derived(entry["id"], f"percussive-{entry['name']}", p_p, {"separation": mode})
-            return jsonify({"harmonic": h, "percussive": p})
-        if mode == "vocal_accompaniment":
-            p_v = os.path.join(tmp, "vocal.wav")
-            p_a = os.path.join(tmp, "accompaniment.wav")
-            separation.mid_side_separate(_abs_path(entry), p_v, p_a)
-            v = _register_derived(entry["id"], f"vocal-{entry['name']}", p_v, {"separation": mode})
-            a = _register_derived(entry["id"], f"accompaniment-{entry['name']}", p_a, {"separation": mode})
-            return jsonify({"vocal": v, "accompaniment": a})
-        if mode == "bands":
-            p_b = os.path.join(tmp, "bass.wav")
-            p_m = os.path.join(tmp, "mid.wav")
-            p_t = os.path.join(tmp, "treble.wav")
-            separation.bands_separate(_abs_path(entry), p_b, p_m, p_t)
-            b = _register_derived(entry["id"], f"bass-{entry['name']}", p_b, {"separation": mode})
-            m = _register_derived(entry["id"], f"mid-{entry['name']}", p_m, {"separation": mode})
-            t = _register_derived(entry["id"], f"treble-{entry['name']}", p_t, {"separation": mode})
-            return jsonify({"bass": b, "mid": m, "treble": t})
+        with _readable_audio(entry) as src:
+            if mode == "harmonic_percussive":
+                p_h = os.path.join(tmp, "harmonic.wav")
+                p_p = os.path.join(tmp, "percussive.wav")
+                separation.hpss_separate(src, p_h, p_p, max_seconds=max_seconds)
+                h = _register_derived(entry["id"], f"harmonic-{entry['name']}", p_h, {"separation": mode})
+                p = _register_derived(entry["id"], f"percussive-{entry['name']}", p_p, {"separation": mode})
+                return jsonify({"harmonic": h, "percussive": p})
+            if mode == "vocal_accompaniment":
+                p_v = os.path.join(tmp, "vocal.wav")
+                p_a = os.path.join(tmp, "accompaniment.wav")
+                separation.mid_side_separate(src, p_v, p_a)
+                v = _register_derived(entry["id"], f"vocal-{entry['name']}", p_v, {"separation": mode})
+                a = _register_derived(entry["id"], f"accompaniment-{entry['name']}", p_a, {"separation": mode})
+                return jsonify({"vocal": v, "accompaniment": a})
+            if mode == "bands":
+                p_b = os.path.join(tmp, "bass.wav")
+                p_m = os.path.join(tmp, "mid.wav")
+                p_t = os.path.join(tmp, "treble.wav")
+                separation.bands_separate(src, p_b, p_m, p_t)
+                b = _register_derived(entry["id"], f"bass-{entry['name']}", p_b, {"separation": mode})
+                m = _register_derived(entry["id"], f"mid-{entry['name']}", p_m, {"separation": mode})
+                t = _register_derived(entry["id"], f"treble-{entry['name']}", p_t, {"separation": mode})
+                return jsonify({"bass": b, "mid": m, "treble": t})
         return jsonify(error="unknown mode"), 400
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -506,7 +566,8 @@ def api_effects_preview():
     chain = data.get("chain", [])
     start = float(data.get("start", 0))
     duration = float(data.get("duration", 6))
-    wav = effects.render_preview(_abs_path(entry), chain, start, duration)
+    with _readable_audio(entry) as src:
+        wav = effects.render_preview(src, chain, start, duration)
     return jsonify({"wav": base64.b64encode(wav).decode(), "size": len(wav)})
 
 
@@ -522,7 +583,8 @@ def api_effects_apply():
 
     file_id_new = storage.new_id()
     dst = os.path.join(store.audio_dir, file_id_new + ".wav")
-    effects.apply_chain_to_file(_abs_path(entry), dst, chain)
+    with _readable_audio(entry) as src:
+        effects.apply_chain_to_file(src, dst, chain)
     new_entry = _register_derived(entry["id"], name, dst, {"effects": chain})
     return jsonify(new_entry)
 
@@ -607,24 +669,39 @@ def api_export():
     file_id_new = storage.new_id()
     dst = os.path.join(store.audio_dir, file_id_new + "." + ext)
     audio_io.convert(_abs_path(entry), dst, fmt, dst_sr=dst_sr,
-                     sample_width=sample_width, channels=channels, bitrate=bitrate)
+                     sample_width=sample_width, channels=channels, bitrate=bitrate,
+                     src_sr=entry.get("sr"), src_channels=entry.get("channels"),
+                     src_sample_width=int(entry.get("sample_width") or 2))
 
-    # Read back what we can about the exported file.
-    sr, ch, frames, duration, size = _probe(dst, fmt)
-    entry = store.add_file({
+    # Read back what we can about the exported file. RAW/PCM has no header, so
+    # derive its frame count from the byte size and persist the parameters used
+    # during export; those parameters are required to wrap/play it later.
+    if fmt == "raw":
+        sr = int(dst_sr or entry.get("sr") or 0)
+        ch = int(channels or entry.get("channels") or 0)
+        sample_width = 2
+        size = os.path.getsize(dst)
+        frames = size // (sample_width * ch) if sr and ch else 0
+        sr_out, ch_out, frames_out, duration_out, size_out = (
+            sr, ch, frames, frames / sr if sr else 0.0, size)
+    else:
+        sr_out, ch_out, frames_out, duration_out, size_out = _probe(dst, fmt)
+        sample_width = audio_io.WAV_SAMPLE_WIDTHS.get(sample_width, 2) if fmt == "wav" else None
+    new_entry = store.add_file({
         "id": file_id_new,
         "name": f"{entry['name'].rsplit('.', 1)[0]}.{ext}",
         "original_format": fmt,
         "path": f"audio/{file_id_new}.{ext}",
-        "sr": sr,
-        "channels": ch,
-        "frames": frames,
-        "duration": duration,
-        "size_bytes": size,
+        "sr": sr_out,
+        "channels": ch_out,
+        "frames": frames_out,
+        "duration": duration_out,
+        "size_bytes": size_out,
+        "sample_width": sample_width,
         "derived_from": file_id,
         "exported": True,
     })
-    return jsonify(entry)
+    return jsonify(new_entry)
 
 
 def _probe(path: str, fmt: str):

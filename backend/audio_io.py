@@ -29,7 +29,7 @@ import subprocess
 import tempfile
 import wave
 from dataclasses import dataclass, field
-from typing import Generator, List, Optional, Sequence, Tuple
+from typing import BinaryIO, Generator, List, Optional, Sequence, Tuple
 
 from . import dsp
 
@@ -247,6 +247,79 @@ class WavReader:
         return AudioData(chunk if chunk is not None else [[] for _ in range(self.channels)], self.sr)
 
 
+class RawReader:
+    """Streaming reader for headerless little-endian PCM files.
+
+    RAW files do not carry audio parameters, so they must be supplied by the
+    caller (normally from the library entry written during RAW export).
+    """
+
+    def __init__(self, path: str, sr: int, channels: int, sample_width: int = 2):
+        if sample_width not in (1, 2, 3, 4):
+            raise ValueError(f"unsupported RAW sample width {sample_width}")
+        self.path = path
+        self.sr = int(sr)
+        self.channels = int(channels)
+        self.sample_width = int(sample_width)
+        self.comptype = "NONE"
+        size = os.path.getsize(path)
+        self.nframes = size // (self.sample_width * self.channels)
+        self._pos = 0
+        self._f: Optional[BinaryIO] = None
+
+    @property
+    def duration(self) -> float:
+        return self.nframes / self.sr if self.sr else 0.0
+
+    def __enter__(self) -> "RawReader":
+        self._f = open(self.path, "rb")
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._f is not None:
+            self._f.close()
+            self._f = None
+
+    def read_chunk(self, nframes: int) -> Optional[List[List[float]]]:
+        if self._f is None:
+            raise ValueError("RawReader must be used as a context manager")
+        raw = self._f.read(nframes * self.sample_width * self.channels)
+        if not raw:
+            return None
+        usable = (len(raw) // (self.sample_width * self.channels)
+                  * self.sample_width * self.channels)
+        raw = raw[:usable]
+        inter = _decode_pcm(raw, self.sample_width)
+        n = len(raw) // (self.sample_width * self.channels)
+        self._pos += n
+        return deinterleave(inter, self.channels)
+
+    def iter_chunks(self, nframes: int = 1 << 16) -> Generator[List[List[float]], None, None]:
+        while True:
+            chunk = self.read_chunk(nframes)
+            if chunk is None:
+                break
+            yield chunk
+
+    def read_excerpt(self, start_frame: int, nframes: int) -> AudioData:
+        if self._f is None:
+            raise ValueError("RawReader must be used as a context manager")
+        self._f.seek(start_frame * self.sample_width * self.channels)
+        self._pos = start_frame
+        chunk = self.read_chunk(nframes)
+        return AudioData(chunk if chunk is not None else [[] for _ in range(self.channels)], self.sr)
+
+
+def open_reader(path: str, fmt: Optional[str] = None, **raw_params):
+    """Open a WAV or headerless RAW PCM file with the same streaming interface."""
+    if fmt == "raw" or (fmt is None and path.lower().endswith(".raw")):
+        return RawReader(path, **raw_params)
+    return WavReader(path)
+
+
 class WavWriter:
     """Streaming PCM WAV writer that patches the header on close.
 
@@ -308,6 +381,31 @@ class WavWriter:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+def build_wav_header(sr: int, channels: int, sample_width: int, data_size: int) -> bytes:
+    """Build a 44-byte PCM WAV header for a known data payload."""
+    byte_rate = sr * channels * sample_width
+    block_align = channels * sample_width
+    return (
+        b"RIFF"
+        + struct.pack("<I", 36 + data_size)
+        + b"WAVEfmt "
+        + struct.pack("<IHHIIHH", 16, 1, channels, sr, byte_rate, block_align,
+                      sample_width * 8)
+        + b"data"
+        + struct.pack("<I", data_size)
+    )
+
+
+def raw_to_wav(src_path: str, dst_path: str, sr: int, channels: int,
+               sample_width: int = 2) -> str:
+    """Prepend a WAV header to a headerless PCM file by streaming it."""
+    data_size = os.path.getsize(src_path)
+    with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
+        dst.write(build_wav_header(sr, channels, sample_width, data_size))
+        shutil.copyfileobj(src, dst, length=1 << 20)
+    return dst_path
 
 
 # --------------------------------------------------------------------------- #
@@ -405,29 +503,50 @@ WAV_SAMPLE_WIDTHS = {"pcm16": 2, "pcm24": 3, "pcm8": 1, "float32": 4}
 
 def convert(src_path: str, dst_path: str, fmt: str, dst_sr: Optional[int] = None,
             sample_width: str = "pcm16", channels: Optional[int] = None,
-            bitrate: str = "192k") -> str:
+            bitrate: str = "192k", src_sr: Optional[int] = None,
+            src_channels: Optional[int] = None,
+            src_sample_width: int = 2) -> str:
     """Convert ``src_path`` to ``dst_path`` in the requested format.
 
     ``fmt`` is one of: wav, aiff, raw, mp3, ogg, flac, m4a.
+    Headerless RAW sources additionally require their PCM parameters.
     """
-    # Normalise the source to a WAV first (in case it is compressed).
-    src_wav = src_path if src_path.lower().endswith(".wav") else decode_with_ffmpeg(src_path)
-
-    if fmt == "wav":
-        return _convert_wav(src_wav, dst_path, dst_sr, sample_width, channels)
-    if fmt == "aiff":
-        return _convert_aiff(src_wav, dst_path, dst_sr, channels)
-    if fmt == "raw":
-        return _convert_raw(src_wav, dst_path, dst_sr, channels)
-    if fmt in ("mp3", "ogg", "flac", "m4a"):
-        # ffmpeg handles resample/channel mixdown itself via the output spec.
-        tmp = src_wav
-        if dst_sr or channels:
-            fd, tmp = tempfile.mkstemp(suffix=".wav")
+    # Normalise the source to a WAV first (in case it is compressed/raw).
+    temporary_files: List[str] = []
+    try:
+        if src_path.lower().endswith(".wav"):
+            src_wav = src_path
+        elif src_path.lower().endswith(".raw"):
+            if not src_sr or not src_channels:
+                raise ValueError("RAW source sample rate and channel count are required")
+            fd, src_wav = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
-            _convert_wav(src_wav, tmp, dst_sr, "pcm16", channels)
-        return encode_with_ffmpeg(tmp, dst_path, fmt, bitrate)
-    raise ValueError(f"unknown format {fmt}")
+            temporary_files.append(src_wav)
+            raw_to_wav(src_path, src_wav, src_sr, src_channels, src_sample_width)
+        else:
+            src_wav = decode_with_ffmpeg(src_path)
+
+        if fmt == "wav":
+            return _convert_wav(src_wav, dst_path, dst_sr, sample_width, channels)
+        if fmt == "aiff":
+            return _convert_aiff(src_wav, dst_path, dst_sr, channels)
+        if fmt == "raw":
+            return _convert_raw(src_wav, dst_path, dst_sr, channels)
+        if fmt in ("mp3", "ogg", "flac", "m4a"):
+            # ffmpeg handles resample/channel mixdown itself via the output spec.
+            tmp = src_wav
+            if dst_sr or channels:
+                fd, tmp = tempfile.mkstemp(suffix=".wav")
+                os.close(fd)
+                _convert_wav(src_wav, tmp, dst_sr, "pcm16", channels)
+            return encode_with_ffmpeg(tmp, dst_path, fmt, bitrate)
+        raise ValueError(f"unknown format {fmt}")
+    finally:
+        for path in temporary_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def _convert_wav(src_wav: str, dst_path: str, dst_sr: Optional[int],
@@ -489,10 +608,10 @@ def _convert_raw(src_wav: str, dst_path: str, dst_sr: Optional[int],
                         rs.push(c[i])
                         out_ch.append(rs.pull(len(c[i])))
                     c = out_ch
-                inter = []
-                n = min(len(x) for x in c)
-                for i in range(n):
-                    for x in c:
-                        inter.append(x[i])
+                inter = interleave(c)
                 f.write(_encode_pcm_16(inter))
+            if need_resample:
+                tail = [rs.flush(1 << 20) for rs in resamplers]
+                if any(tail):
+                    f.write(_encode_pcm_16(interleave(tail)))
     return dst_path
