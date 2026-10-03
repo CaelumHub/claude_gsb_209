@@ -16,11 +16,12 @@ import base64
 import io
 import math
 import os
+import re
 import shutil
 import tempfile
 from typing import Dict, Optional
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, Response, jsonify, render_template, request, send_file
 
 from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, storage
 
@@ -49,6 +50,30 @@ rt = realtime.new_analyzer()
 
 def _abs_path(entry: Dict) -> str:
     return os.path.join(DATA_DIR, entry["path"])
+
+
+def _open_entry_audio(entry: Dict):
+    """Open a library entry's audio for streaming.
+
+    RAW (headerless PCM) entries are opened with the parameters recorded in
+    the index; every other format is a normal WAV.
+    """
+    return audio_io.open_audio(
+        _abs_path(entry),
+        sr=entry.get("sr") or None,
+        channels=entry.get("channels") or None,
+        sample_width=entry.get("raw_sample_width", 2),
+    )
+
+
+def _raw_wav_header(entry: Dict, data_size: int) -> bytes:
+    """44-byte WAV header wrapping a headerless-PCM blob for browser playback."""
+    return audio_io.wav_pcm_header(
+        int(entry.get("sr") or 0),
+        int(entry.get("channels") or 1),
+        int(entry.get("raw_sample_width", 2)),
+        data_size,
+    )
 
 
 def _entry(file_id: str) -> Optional[Dict]:
@@ -262,7 +287,74 @@ def api_audio(file_id: str):
     entry = _entry(file_id)
     if not entry:
         return jsonify(error="file not found"), 404
-    return send_file(_abs_path(entry), mimetype="audio/wav")
+    path = _abs_path(entry)
+    if not entry.get("path", "").lower().endswith(".raw"):
+        return send_file(path, mimetype="audio/wav")
+
+    # RAW = headerless PCM: browsers cannot decode it on its own, so serve it
+    # wrapped in a WAV header generated from the parameters stored in the
+    # library entry.  The header (44 bytes) plus the raw blob is exposed as a
+    # single virtual WAV byte space; Range requests map onto that space, so the
+    # browser parses the container on the first fetch and seeks into PCM after.
+    size = os.path.getsize(path)
+    sw = int(entry.get("raw_sample_width", 2))
+    ch = int(entry.get("channels") or 1)
+    frame_size = sw * ch
+    header = _raw_wav_header(entry, size)
+    total = len(header) + size
+
+    def serve(start: int, end: int, status: int):
+        # Virtual layout: [header][raw PCM]
+        parts = []
+        if start < len(header):
+            parts.append(header[start:min(end + 1, len(header))])
+        d_start = max(0, start - len(header))
+        d_end = min(end, total - 1) - len(header)
+
+        def _generate():
+            for p in parts:
+                yield p
+            if d_end >= d_start:
+                with open(path, "rb") as f:
+                    f.seek(d_start)
+                    remaining = d_end - d_start + 1
+                    # Align reads to whole frames for clean boundaries.
+                    while remaining > 0:
+                        buf = f.read(min(1 << 20, remaining))
+                        if not buf:
+                            break
+                        remaining -= len(buf)
+                        yield buf
+
+        resp = Response(_generate(), status=status, mimetype="audio/wav",
+                        direct_passthrough=True)
+        length = end - start + 1
+        resp.headers["Content-Length"] = str(length)
+        resp.headers["Accept-Ranges"] = "bytes"
+        if status == 206:
+            resp.headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        return resp
+
+    range_header = request.headers.get("Range", "")
+    m = re.match(r"bytes=(\d*)-(\d*)$", range_header.strip())
+    if m and (m.group(1) or m.group(2)):
+        if m.group(1):  # bytes=START[-END]
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else total - 1
+        else:           # suffix range: bytes=-N (last N bytes)
+            n = int(m.group(2))
+            start, end = max(0, total - n), total - 1
+        start = min(start, total - 1)
+        end = min(end, total - 1)
+        # Align a PCM-only range start to a frame boundary so the browser's
+        # decoder never begins on a half sample.
+        if start >= len(header):
+            start -= start % frame_size
+        if start > end:
+            start, end = end, start
+        return serve(start, end, 206)
+
+    return serve(0, total - 1, 200)
 
 
 @app.get("/api/download/<file_id>")
@@ -280,7 +372,12 @@ def api_waveform(file_id: str):
         return jsonify(error="file not found"), 404
     points = int(request.args.get("points", 2000))
     channel = int(request.args.get("channel", 0))
-    return jsonify(analysis.waveform_envelope(_abs_path(entry), points=points, channel=channel))
+    is_raw = entry.get("path", "").lower().endswith(".raw")
+    return jsonify(analysis.waveform_envelope(
+        _abs_path(entry), points=points, channel=channel,
+        raw_sr=entry.get("sr") if is_raw else None,
+        raw_channels=entry.get("channels") if is_raw else None,
+        raw_sample_width=entry.get("raw_sample_width", 2)))
 
 
 @app.get("/api/audio/<file_id>/samples")
@@ -292,7 +389,7 @@ def api_samples(file_id: str):
     start = float(request.args.get("start", 0.0))
     duration = float(request.args.get("duration", 5.0))
     max_n = int(request.args.get("max", 50000))
-    with audio_io.WavReader(_abs_path(entry)) as r:
+    with _open_entry_audio(entry) as r:
         sr = r.sr
         start_f = max(0, int(start * sr))
         n = min(max_n, int(duration * sr))
@@ -305,9 +402,9 @@ def api_samples(file_id: str):
 # Waveform edits
 # --------------------------------------------------------------------------- #
 
-def _apply_edit(src_path: str, dst_path: str, op: str, params: Dict) -> None:
+def _apply_edit(entry: Dict, dst_path: str, op: str, params: Dict) -> None:
     """Streaming waveform edit: trim / silence / fade / gain / normalize / reverse."""
-    with audio_io.WavReader(src_path) as r:
+    with _open_entry_audio(entry) as r:
         sr = r.sr
         ch = r.channels
         total = r.nframes
@@ -333,7 +430,7 @@ def _apply_edit(src_path: str, dst_path: str, op: str, params: Dict) -> None:
         # Normalise needs a peak pre-scan.
         if op == "normalize":
             peak = 0.0
-            with audio_io.WavReader(src_path) as rr:
+            with _open_entry_audio(entry) as rr:
                 for chunk in rr.iter_chunks():
                     for c in chunk:
                         for v in c:
@@ -387,7 +484,7 @@ def api_edit(file_id: str):
 
     file_id_new = storage.new_id()
     dst = os.path.join(store.audio_dir, file_id_new + ".wav")
-    _apply_edit(_abs_path(entry), dst, op, data.get("params", {}))
+    _apply_edit(entry, dst, op, data.get("params", {}))
     new_entry = _register_derived(entry["id"], name, dst, {"op": op})
     return jsonify(new_entry)
 
@@ -606,12 +703,12 @@ def api_export():
     ext = fmt
     file_id_new = storage.new_id()
     dst = os.path.join(store.audio_dir, file_id_new + "." + ext)
-    audio_io.convert(_abs_path(entry), dst, fmt, dst_sr=dst_sr,
-                     sample_width=sample_width, channels=channels, bitrate=bitrate)
+    info = audio_io.convert(_abs_path(entry), dst, fmt, dst_sr=dst_sr,
+                            sample_width=sample_width, channels=channels, bitrate=bitrate)
 
     # Read back what we can about the exported file.
-    sr, ch, frames, duration, size = _probe(dst, fmt)
-    entry = store.add_file({
+    sr, ch, frames, duration, size, sample_width_out = _probe(dst, fmt, info)
+    new_entry = {
         "id": file_id_new,
         "name": f"{entry['name'].rsplit('.', 1)[0]}.{ext}",
         "original_format": fmt,
@@ -623,19 +720,44 @@ def api_export():
         "size_bytes": size,
         "derived_from": file_id,
         "exported": True,
-    })
+    }
+    # Raw (headerless PCM) files keep their parameters only in the index;
+    # record the bit depth so they can be decoded/wrapped later.
+    if fmt == "raw":
+        new_entry["raw_sample_width"] = sample_width_out
+    entry = store.add_file(new_entry)
     return jsonify(entry)
 
 
-def _probe(path: str, fmt: str):
-    """Best-effort metadata probe for an exported file (ffmpeg for compressed)."""
+def _probe(path: str, fmt: str, info: Optional[Dict] = None):
+    """Best-effort metadata probe for an exported file.
+
+    Returns ``(sr, channels, frames, duration, size, sample_width)``.  WAV is
+    read directly; ``raw`` has no header so its parameters come from the
+    converter's ``info`` and its frame count is derived from the file size;
+    compressed formats fall back to ffprobe.
+    """
+    size = os.path.getsize(path)
     if fmt == "wav":
         try:
             with audio_io.WavReader(path) as r:
-                return r.sr, r.channels, r.nframes, r.duration, os.path.getsize(path)
+                return r.sr, r.channels, r.nframes, r.duration, size, r.sample_width
         except Exception:
-            pass
-    size = os.path.getsize(path)
+            # stdlib wave rejects IEEE-float WAVs; parse the header directly.
+            try:
+                sr, ch, sw, frames = audio_io._probe_wav_header(path)
+                return sr, ch, frames, frames / sr if sr else 0.0, size, sw
+            except Exception:
+                pass
+    if fmt == "raw":
+        info = info or {}
+        sr = int(info.get("sr") or 0)
+        ch = int(info.get("channels") or 1)
+        sw = int(info.get("sample_width") or 2)
+        frame_size = sw * ch
+        frames = int(info.get("frames") or (size // frame_size if frame_size else 0))
+        duration = frames / sr if sr else 0.0
+        return sr, ch, frames, duration, size, sw
     # Use ffprobe if available for duration.
     try:
         import subprocess
@@ -644,12 +766,12 @@ def _probe(path: str, fmt: str):
              "stream=sample_rate,channels:format=duration",
              "-of", "json", path], capture_output=True, timeout=60)
         import json
-        info = json.loads(out.stdout)
-        st = info.get("streams", [{}])[0]
-        dur = float(info.get("format", {}).get("duration", 0) or 0)
-        return int(st.get("sample_rate", 0) or 0), int(st.get("channels", 0) or 0), 0, dur, size
+        probe_info = json.loads(out.stdout)
+        st = probe_info.get("streams", [{}])[0]
+        dur = float(probe_info.get("format", {}).get("duration", 0) or 0)
+        return int(st.get("sample_rate", 0) or 0), int(st.get("channels", 0) or 0), 0, dur, size, 0
     except Exception:
-        return 0, 0, 0, 0.0, size
+        return 0, 0, 0, 0.0, size, 0
 
 
 # --------------------------------------------------------------------------- #

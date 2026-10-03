@@ -267,9 +267,12 @@ def analyze_beats(path: str, nfft: int = 2048, hop: int = 512,
 # --------------------------------------------------------------------------- #
 
 def waveform_envelope(path: str, points: int = 2000,
-                      channel: int = 0) -> Dict:
+                      channel: int = 0, raw_sr: Optional[int] = None,
+                      raw_channels: Optional[int] = None,
+                      raw_sample_width: int = 2) -> Dict:
     """Min/max envelope per bucket for fast, accurate waveform rendering."""
-    with audio_io.WavReader(path) as r:
+    with audio_io.open_audio(path, sr=raw_sr, channels=raw_channels,
+                             sample_width=raw_sample_width) as r:
         sr = r.sr
         channels = r.channels
         nframes = r.nframes
